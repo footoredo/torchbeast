@@ -21,16 +21,22 @@ import time
 import timeit
 import traceback
 import typing
+from collections import defaultdict, deque
+import joblib
 
-os.environ["OMP_NUM_THREADS"] = "1"  # Necessary for multithreading.
+# os.environ["OMP_NUM_THREADS"] = "1"  # Necessary for multithreading.
 
 import torch
 from torch import multiprocessing as mp
 from torch import nn
 from torch.nn import functional as F
 
+import gym
+import nle
+
 from torchbeast import atari_wrappers
 from torchbeast.core import environment
+from torchbeast.core import net
 from torchbeast.core import file_writer
 from torchbeast.core import prof
 from torchbeast.core import vtrace
@@ -46,6 +52,11 @@ parser.add_argument("--mode", default="train",
                     help="Training or test mode.")
 parser.add_argument("--xpid", default=None,
                     help="Experiment id (default: None).")
+
+parser.add_argument("--loaddir")
+parser.add_argument("--no_actor_learning", action="store_true")
+parser.add_argument("--no_predictor_learning", action="store_true")
+parser.add_argument("--test_episodes", default=10, type=int)
 
 # Training settings.
 parser.add_argument("--disable_checkpoint", action="store_true",
@@ -69,6 +80,9 @@ parser.add_argument("--disable_cuda", action="store_true",
 parser.add_argument("--use_lstm", action="store_true",
                     help="Use LSTM in agent model.")
 
+parser.add_argument("--save_ttyrec_every", default=1000, type=int,
+                    metavar="N", help="Save ttyrec every N episodes.")
+
 # Loss settings.
 parser.add_argument("--entropy_cost", default=0.0006,
                     type=float, help="Entropy cost/multiplier.")
@@ -77,7 +91,7 @@ parser.add_argument("--baseline_cost", default=0.5,
 parser.add_argument("--discounting", default=0.99,
                     type=float, help="Discounting factor.")
 parser.add_argument("--reward_clipping", default="abs_one",
-                    choices=["abs_one", "none"],
+                    choices=["abs_one", "tanh", "none"],
                     help="Reward clipping.")
 
 # Optimizer settings.
@@ -138,13 +152,11 @@ def act(
         logging.info("Actor %i started.", actor_index)
         timings = prof.Timings()  # Keep track of how fast things are.
 
-        gym_env = create_env(flags)
         seed = actor_index ^ int.from_bytes(os.urandom(4), byteorder="little")
-        gym_env.seed(seed)
-        env = environment.Environment(gym_env)
+        env = create_env(flags, seed, False)
         env_output = env.initial()
         agent_state = model.initial_state(batch_size=1)
-        agent_output, unused_state = model(env_output, agent_state)
+        agent_output, unused_state, _ = model(env_output, agent_state)
         while True:
             index = free_queue.get()
             if index is None:
@@ -163,7 +175,7 @@ def act(
                 timings.reset()
 
                 with torch.no_grad():
-                    agent_output, agent_state = model(env_output, agent_state)
+                    agent_output, agent_state, _ = model(env_output, agent_state)
 
                 timings.time("model")
 
@@ -235,7 +247,7 @@ def learn(
 ):
     """Performs a learning (optimization) step."""
     with lock:
-        learner_outputs, unused_state = model(batch, initial_agent_state)
+        learner_outputs, unused_state, _ = model(batch, initial_agent_state)
 
         # Take final value function slice for bootstrapping.
         bootstrap_value = learner_outputs["baseline"][-1]
@@ -247,6 +259,8 @@ def learn(
         rewards = batch["reward"]
         if flags.reward_clipping == "abs_one":
             clipped_rewards = torch.clamp(rewards, -1, 1)
+        elif flags.reward_clipping == "tanh":
+            clipped_rewards = torch.tanh(rewards / 100)
         elif flags.reward_clipping == "none":
             clipped_rewards = rewards
 
@@ -296,20 +310,79 @@ def learn(
         return stats
 
 
-def create_buffers(flags, obs_shape, num_actions) -> Buffers:
-    T = flags.unroll_length
-    specs = dict(
-        frame=dict(size=(T + 1, *obs_shape), dtype=torch.uint8),
-        reward=dict(size=(T + 1,), dtype=torch.float32),
-        done=dict(size=(T + 1,), dtype=torch.bool),
-        episode_return=dict(size=(T + 1,), dtype=torch.float32),
-        episode_step=dict(size=(T + 1,), dtype=torch.int32),
-        policy_logits=dict(size=(T + 1, num_actions), dtype=torch.float32),
-        baseline=dict(size=(T + 1,), dtype=torch.float32),
-        last_action=dict(size=(T + 1,), dtype=torch.int64),
-        action=dict(size=(T + 1,), dtype=torch.int64),
+def predictor_learn(
+    flags,
+    model,
+    batch,
+    optimizer,
+    lock=threading.Lock(),  # noqa: B008
+):
+    """Performs a learning (optimization) step."""
+    with lock:
+        prediction_outputs, obs_embedding, oa_embedding = model(batch)
+
+        rewards = batch["reward"]
+        reward_prediction_loss = (prediction_outputs["reward"] - rewards / 10).square().mean()
+
+        contrast_loss = 0
+        cnt = 0
+
+        T, B = rewards.shape
+        for i in range(B):
+            embeds = []
+            for j in range(T):
+                if abs(rewards[j, i].item()) > 0.5:
+                    embeds.append(oa_embedding[j, i])
+                if batch["done"][j, i].item() or j == T - 1:
+                    L = len(embeds)
+                    if L > 1:
+                        _embeds = torch.stack(embeds, 0)
+                        in_dis = (_embeds.unsqueeze(0) - _embeds.unsqueeze(1)).square().sum(-1)
+                        d = torch.exp(-in_dis / in_dis.max() * 2)
+                        c = torch.det(d)
+                        contrast_loss -= c
+                        cnt += 1
+                    embeds = []
+
+        if cnt > 0:
+            contrast_loss /= cnt
+        total_loss = reward_prediction_loss + contrast_loss
+
+        stats = {
+            "reward_prediction_loss": reward_prediction_loss.item(),
+            "contrast_loss": contrast_loss.item() if cnt > 0 else 0,
+            "predictor_total_loss": total_loss.item(),
+        }
+
+        optimizer.zero_grad()
+        total_loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), flags.grad_norm_clipping)
+        optimizer.step()
+
+        return stats
+
+
+def create_buffers(flags, observation_space, num_actions, num_overlapping_steps=1):
+    size = (flags.unroll_length + num_overlapping_steps,)
+
+    # Get specimens to infer shapes and dtypes.
+    samples = {k: torch.from_numpy(v) for k, v in observation_space.sample().items()}
+
+    specs = {
+        key: dict(size=size + sample.shape, dtype=sample.dtype)
+        for key, sample in samples.items()
+    }
+    specs.update(
+        reward=dict(size=size, dtype=torch.float32),
+        done=dict(size=size, dtype=torch.bool),
+        episode_return=dict(size=size, dtype=torch.float32),
+        episode_step=dict(size=size, dtype=torch.int32),
+        policy_logits=dict(size=size + (num_actions,), dtype=torch.float32),
+        baseline=dict(size=size, dtype=torch.float32),
+        last_action=dict(size=size, dtype=torch.int64),
+        action=dict(size=size, dtype=torch.int64),
     )
-    buffers: Buffers = {key: [] for key in specs}
+    buffers = {key: [] for key in specs}
     for _ in range(flags.num_buffers):
         for key in buffers:
             buffers[key].append(torch.empty(**specs[key]).share_memory_())
@@ -344,10 +417,32 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
         logging.info("Not using CUDA.")
         flags.device = torch.device("cpu")
 
-    env = create_env(flags)
+    torch.set_num_threads(30)
 
-    model = Net(env.observation_space.shape, env.action_space.n, flags.use_lstm)
-    buffers = create_buffers(flags, env.observation_space.shape, model.num_actions)
+    load = flags.loaddir is not None
+    if load:
+        loadpath = os.path.expandvars(
+            os.path.expanduser("%s/%s" % (flags.loaddir, "model.tar"))
+        )
+        load_checkpoint_cpu = torch.load(loadpath, map_location="cpu")
+        load_checkpoint = torch.load(loadpath, map_location=flags.device)
+
+    def show_state_dict(state_dict):
+        for item in state_dict:
+            print(item)
+        print()
+
+    env = create_env(flags, None, False, savedir=flags.savedir, save_ttyrec_every=flags.save_ttyrec_every)
+
+    model = net.get_policy(flags.env, env.observation_space, env.action_space.n, flags.use_lstm)
+
+    # show_state_dict(model.state_dict())
+
+    if load and "model_state_dict" in load_checkpoint_cpu:
+        # show_state_dict(load_checkpoint_cpu["model_state_dict"])
+        model.load_state_dict(load_checkpoint_cpu["model_state_dict"])
+
+    buffers = create_buffers(flags, env.observation_space, model.num_actions)
 
     model.share_memory()
 
@@ -380,10 +475,18 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
         actor.start()
         actor_processes.append(actor)
 
-    learner_model = Net(
-        env.observation_space.shape, env.action_space.n, flags.use_lstm
+    learner_model = net.get_policy(flags.env,
+        env.observation_space, env.action_space.n, flags.use_lstm
     ).to(device=flags.device)
 
+    if load and "model_state_dict" in load_checkpoint:
+        learner_model.load_state_dict(load_checkpoint["model_state_dict"])
+
+    prediction_model = net.get_prediction_net(flags.env, env.observation_space, env.action_space.n).to(device=flags.device)
+
+    if load and "prediction_model_state_dict" in load_checkpoint:
+        prediction_model.load_state_dict(load_checkpoint["prediction_model_state_dict"])
+        
     optimizer = torch.optim.RMSprop(
         learner_model.parameters(),
         lr=flags.learning_rate,
@@ -392,10 +495,27 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
         alpha=flags.alpha,
     )
 
+    if load and "optimizer_state_dict" in load_checkpoint:
+        optimizer.load_state_dict(load_checkpoint["optimizer_state_dict"])
+
+    prediction_optimizer = torch.optim.Adam(
+        prediction_model.parameters(),
+        lr=2.5e-4,
+        eps=1e-5,
+    )
+
+    if load and "prediction_optimizer_state_dict" in load_checkpoint:
+        prediction_optimizer.load_state_dict(load_checkpoint["prediction_optimizer_state_dict"])
+
+
     def lr_lambda(epoch):
         return 1 - min(epoch * T * B, flags.total_steps) / flags.total_steps
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    if load and "scheduler_state_dict" in load_checkpoint:
+        scheduler.load_state_dict(load_checkpoint["scheduler_state_dict"])
+    # print("111", flush=True)
 
     logger = logging.getLogger("logfile")
     stat_keys = [
@@ -404,6 +524,9 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
         "pg_loss",
         "baseline_loss",
         "entropy_loss",
+        "predictor_total_loss",
+        "reward_prediction_loss",
+        "contrast_loss"
     ]
     logger.info("# Step\t%s", "\t".join(stat_keys))
 
@@ -414,6 +537,7 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
         nonlocal step, stats
         timings = prof.Timings()
         while step < flags.total_steps:
+            logger.info(f"{i}, {step}")
             timings.reset()
             batch, agent_state = get_batch(
                 flags,
@@ -423,13 +547,25 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
                 initial_agent_state_buffers,
                 timings,
             )
-            stats = learn(
-                flags, model, learner_model, batch, agent_state, optimizer, scheduler
-            )
+            if not flags.no_actor_learning:
+                learner_stats = learn(
+                    flags, model, learner_model, batch, agent_state, optimizer, scheduler
+                )
+            else:
+                learner_stats = {}
+            if not flags.no_predictor_learning:
+                predictor_stats = predictor_learn(
+                    flags, prediction_model, batch, prediction_optimizer
+                )
+            else:
+                predictor_stats = {}
+            stats = {**learner_stats, **predictor_stats}
+            # print(predictor_stats, stats, flush=True)
+
             timings.time("learn")
             with lock:
                 to_log = dict(step=step)
-                to_log.update({k: stats[k] for k in stat_keys})
+                to_log.update({k: stats[k] for k in stat_keys if k in stats})
                 plogger.log(to_log)
                 step += T * B
 
@@ -455,6 +591,8 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
             {
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "prediction_model_state_dict": prediction_model.state_dict(),
+                "prediction_optimizer_state_dict": prediction_optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "flags": vars(flags),
             },
@@ -464,16 +602,18 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
     timer = timeit.default_timer
     try:
         last_checkpoint_time = timer()
+        sps_deque = deque(maxlen=20)
         while step < flags.total_steps:
             start_step = step
             start_time = timer()
             time.sleep(5)
 
-            if timer() - last_checkpoint_time > 10 * 60:  # Save every 10 min.
+            if timer() - last_checkpoint_time > 5 * 60:  # Save every 10 min.
                 checkpoint()
                 last_checkpoint_time = timer()
 
             sps = (step - start_step) / (timer() - start_time)
+            sps_deque.append(sps)
             if stats.get("episode_returns", None):
                 mean_return = (
                     "Return per episode: %.1f. " % stats["mean_episode_return"]
@@ -481,11 +621,13 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
             else:
                 mean_return = ""
             total_loss = stats.get("total_loss", float("inf"))
+            predictor_total_loss = stats.get("predictor_total_loss", float("inf"))
             logging.info(
-                "Steps %i @ %.1f SPS. Loss %f. %sStats:\n%s",
+                "Steps %i @ %.1f SPS. Loss %f. Predictor loss %f. %sStats:\n%s",
                 step,
-                sps,
+                sum(sps_deque) / len(sps_deque),
                 total_loss,
+                predictor_total_loss,
                 mean_return,
                 pprint.pformat(stats),
             )
@@ -505,7 +647,7 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
     plogger.close()
 
 
-def test(flags, num_episodes: int = 10):
+def test(flags, num_episodes: int = 10, save_data: bool = True):
     if flags.xpid is None:
         checkpointpath = "./latest/model.tar"
     else:
@@ -513,22 +655,61 @@ def test(flags, num_episodes: int = 10):
             os.path.expanduser("%s/%s/%s" % (flags.savedir, flags.xpid, "model.tar"))
         )
 
-    gym_env = create_env(flags)
-    env = environment.Environment(gym_env)
-    model = Net(gym_env.observation_space.shape, gym_env.action_space.n, flags.use_lstm)
-    model.eval()
+    if flags.test_episodes is not None:
+        num_episodes = flags.test_episodes
+
+    env = create_env(flags, None, True, save_ttyrec_every=flags.save_ttyrec_every)
+    model = net.get_policy(flags.env, env.observation_space, env.action_space.n, flags.use_lstm)
+    # model.eval()
+    prediction_model = net.get_prediction_net(flags.env, env.observation_space, env.action_space.n)
+    prediction_model.eval()
     checkpoint = torch.load(checkpointpath, map_location="cpu")
     model.load_state_dict(checkpoint["model_state_dict"])
+    prediction_model.load_state_dict(checkpoint["prediction_model_state_dict"])
+    # print(prediction_model.state_dict())
 
     observation = env.initial()
     returns = []
+
+    achievement_counts = defaultdict(int)
+
+    if flags.env.startswith('NetHack'):
+        obs_keys = ['glyphs', 'blstats', 'chars']
+    else:
+        obs_keys = ['frame']
+
+    keys = ['action', 'policy_logits', 'hidden', 'baseline', 'reward', 'unlocked', 'reward_prediction', 'obs_hidden', 'oa_hidden', *obs_keys]
+    data_cur = { key: [] for key in keys }
+    for key in obs_keys:
+        data_cur[key].append(observation[key])
+    episode_data = { key: [] for key in keys }
 
     while len(returns) < num_episodes:
         if flags.mode == "test_render":
             env.gym_env.render()
         agent_outputs = model(observation)
-        policy_outputs, _ = agent_outputs
+        policy_outputs, _, policy_hidden = agent_outputs
+        last_obs = { key: observation[key].clone() for key in obs_keys }
         observation = env.step(policy_outputs["action"])
+
+        preidctor_outputs, obs_hidden, oa_hidden = prediction_model({
+            "action": policy_outputs["action"],
+            ** { key: observation[key] for key in obs_keys },
+            ** { f'last_{key}': last_obs[key] for key in obs_keys },
+        })
+
+        if save_data:
+            data_cur['action'].append(policy_outputs["action"])
+            data_cur['policy_logits'].append(policy_outputs["policy_logits"])
+            data_cur['baseline'].append(policy_outputs["baseline"])
+            data_cur['hidden'].append(policy_hidden)
+            data_cur['reward'].append(observation["reward"])
+            data_cur['reward_prediction'].append(preidctor_outputs["reward"])
+            data_cur['obs_hidden'].append(obs_hidden)
+            data_cur['oa_hidden'].append(oa_hidden)
+            if "unlocked" in observation["info"]:
+                data_cur['unlocked'].append(list(observation["info"]["unlocked"]))
+
         if observation["done"].item():
             returns.append(observation["episode_return"].item())
             logging.info(
@@ -536,114 +717,64 @@ def test(flags, num_episodes: int = 10):
                 observation["episode_step"].item(),
                 observation["episode_return"].item(),
             )
+            if 'achievements' in observation['info']:
+                for a, c in observation['info']['achievements'].items():
+                    if c > 0:
+                        achievement_counts[a] += 1
+            if save_data:
+                for key, value in data_cur.items():
+                    if len(value) > 0:
+                        if isinstance(value[0], torch.Tensor):
+                            episode_data[key].append(torch.concat(value, 0).squeeze(1).detach().numpy())
+                        else:
+                            episode_data[key].append(value)
+                data_cur = { key: [] for key in keys }
+                for key in obs_keys:
+                    data_cur[key].append(observation[key].clone())
+        elif save_data:
+            for key in obs_keys:
+                data_cur[key].append(observation[key].clone())
+
     env.close()
     logging.info(
         "Average returns over %i steps: %.1f", num_episodes, sum(returns) / len(returns)
     )
 
+    logging.info("Achivement counts:")
+    for a, c in sorted(achievement_counts.items(), key=lambda x: x[1]):
+        logging.info(f"{a}: {c} ({c / len(returns):.2%})")
 
-class AtariNet(nn.Module):
-    def __init__(self, observation_shape, num_actions, use_lstm=False):
-        super(AtariNet, self).__init__()
-        self.observation_shape = observation_shape
-        self.num_actions = num_actions
+    if save_data:
+        joblib.dump(episode_data, os.path.expandvars(
+            os.path.expanduser("%s/%s/%s" % (flags.savedir, flags.xpid, "test.data"))
+        ))
 
-        # Feature extraction.
-        self.conv1 = nn.Conv2d(
-            in_channels=self.observation_shape[0],
-            out_channels=32,
-            kernel_size=8,
-            stride=4,
+
+def create_env(flags, seed, append_info, *args, **kwargs):
+    if flags.env == 'crafter':
+        env = atari_wrappers.wrap_pytorch(
+            atari_wrappers.make_crafter()
         )
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-
-        # Fully connected layer.
-        self.fc = nn.Linear(3136, 512)
-
-        # FC output size + one-hot of last action + last reward.
-        core_output_size = self.fc.out_features + num_actions + 1
-
-        self.use_lstm = use_lstm
-        if use_lstm:
-            self.core = nn.LSTM(core_output_size, core_output_size, 2)
-
-        self.policy = nn.Linear(core_output_size, self.num_actions)
-        self.baseline = nn.Linear(core_output_size, 1)
-
-    def initial_state(self, batch_size):
-        if not self.use_lstm:
-            return tuple()
-        return tuple(
-            torch.zeros(self.core.num_layers, batch_size, self.core.hidden_size)
-            for _ in range(2)
+        if seed is not None:
+            env.seed(seed)
+        return environment.Environment(env, append_info)
+    elif flags.env.startswith('NetHack'):
+        env = gym.make(flags.env, observation_keys=("glyphs", "blstats", "chars"), *args, **kwargs)
+        if seed is not None:
+            env.seed(seed)
+        return environment.NetHackEnvironment(env, append_info)
+    else:
+        env = atari_wrappers.wrap_pytorch(
+            atari_wrappers.wrap_deepmind(
+                atari_wrappers.make_atari(flags.env),
+                clip_rewards=False,
+                frame_stack=True,
+                scale=False,
+            )
         )
-
-    def forward(self, inputs, core_state=()):
-        x = inputs["frame"]  # [T, B, C, H, W].
-        T, B, *_ = x.shape
-        x = torch.flatten(x, 0, 1)  # Merge time and batch.
-        x = x.float() / 255.0
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = x.view(T * B, -1)
-        x = F.relu(self.fc(x))
-
-        one_hot_last_action = F.one_hot(
-            inputs["last_action"].view(T * B), self.num_actions
-        ).float()
-        clipped_reward = torch.clamp(inputs["reward"], -1, 1).view(T * B, 1)
-        core_input = torch.cat([x, clipped_reward, one_hot_last_action], dim=-1)
-
-        if self.use_lstm:
-            core_input = core_input.view(T, B, -1)
-            core_output_list = []
-            notdone = (~inputs["done"]).float()
-            for input, nd in zip(core_input.unbind(), notdone.unbind()):
-                # Reset core state to zero whenever an episode ended.
-                # Make `done` broadcastable with (num_layers, B, hidden_size)
-                # states:
-                nd = nd.view(1, -1, 1)
-                core_state = tuple(nd * s for s in core_state)
-                output, core_state = self.core(input.unsqueeze(0), core_state)
-                core_output_list.append(output)
-            core_output = torch.flatten(torch.cat(core_output_list), 0, 1)
-        else:
-            core_output = core_input
-            core_state = tuple()
-
-        policy_logits = self.policy(core_output)
-        baseline = self.baseline(core_output)
-
-        if self.training:
-            action = torch.multinomial(F.softmax(policy_logits, dim=1), num_samples=1)
-        else:
-            # Don't sample when testing.
-            action = torch.argmax(policy_logits, dim=1)
-
-        policy_logits = policy_logits.view(T, B, self.num_actions)
-        baseline = baseline.view(T, B)
-        action = action.view(T, B)
-
-        return (
-            dict(policy_logits=policy_logits, baseline=baseline, action=action),
-            core_state,
-        )
-
-
-Net = AtariNet
-
-
-def create_env(flags):
-    return atari_wrappers.wrap_pytorch(
-        atari_wrappers.wrap_deepmind(
-            atari_wrappers.make_atari(flags.env),
-            clip_rewards=False,
-            frame_stack=True,
-            scale=False,
-        )
-    )
+        if seed is not None:
+            env.seed(seed)
+        return environment.Environment(env, append_info)
 
 
 def main(flags):

@@ -23,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <random>
 
 #include <grpc++/grpc++.h>
 
@@ -43,6 +44,8 @@
 #include "nest/nest_pybind.h"
 
 namespace py = pybind11;
+
+const int MAX_ENV_DATA_SIZE = 10000;
 
 typedef nest::Nest<torch::Tensor> TensorNest;
 
@@ -344,12 +347,19 @@ class ActorPool {
   ActorPool(int unroll_length, std::shared_ptr<BatchingQueue<>> learner_queue,
             std::shared_ptr<DynamicBatcher> inference_batcher,
             std::vector<std::string> env_server_addresses,
-            TensorNest initial_agent_state)
+            TensorNest initial_agent_state,
+            int num_labels)
       : unroll_length_(unroll_length),
         learner_queue_(std::move(learner_queue)),
         inference_batcher_(std::move(inference_batcher)),
         env_server_addresses_(std::move(env_server_addresses)),
-        initial_agent_state_(std::move(initial_agent_state)) {}
+        initial_agent_state_(std::move(initial_agent_state)),
+        num_labels_(num_labels),
+        env_datas_(num_labels),
+        rng_mutex_() {
+          std::vector<std::mutex> mutexes(num_labels);
+          mutexes_.swap(mutexes);
+        }
 
   void loop(int64_t loop_index, const std::string& address) {
     std::shared_ptr<grpc::Channel> channel =
@@ -391,9 +401,9 @@ class ActorPool {
     if (!all_agent_outputs.is_vector()) {
       throw py::value_error("Expected agent output to be tuple");
     }
-    if (all_agent_outputs.get_vector().size() != 2) {
+    if (all_agent_outputs.get_vector().size() != 3) {
       throw py::value_error(
-          "Expected agent output to be ((action, ...), new_state) but got "
+          "Expected agent output to be ((action, ...), new_state, save_env) but got "
           "sequence of "
           "length " +
           std::to_string(all_agent_outputs.get_vector().size()));
@@ -409,6 +419,8 @@ class ActorPool {
 
     rpcenv::Action action_pb;
     std::vector<TensorNest> rollout;
+    std::unique_lock<std::mutex> rng_lock(rng_mutex_);
+    rng_lock.unlock();
     try {
       while (true) {
         rollout.push_back(std::move(last));
@@ -421,8 +433,35 @@ class ActorPool {
 
           // agent_outputs must be a tuple/list.
           const TensorNest& action = agent_outputs.get_vector().front();
+          // const TensorNest& save_env = all_agent_outputs.get_vector()[2].front();
 
           action_pb.Clear();
+          action_pb.set_save_env(all_agent_outputs.get_vector()[2].front().item<int>());
+
+          {
+            rng_lock.lock();
+            int label = std::uniform_int_distribution<int>(0, num_labels_ - 1)(rng_);
+            int x = std::uniform_int_distribution<int>(0, 3)(rng_);
+            // int x = ~label;
+            // std::cout << "loading env!! label:" << label << std::endl;
+            rng_lock.unlock();
+            if (x) {
+              std::lock_guard<std::mutex> lock(mutexes_[label]);
+              // std::cout << "loading env!! label:" << label << " length: " << env_datas_[label].size() << std::endl;
+              if (env_datas_[label].size() >= 100) {
+                rng_lock.lock();
+                int index = std::uniform_int_distribution<int>(0, env_datas_[label].size() - 1)(rng_);
+                rng_lock.unlock();
+                // dataresetfunc(label, std::move(env_datas_[label][index]));
+                // fill_nest_pb(
+                //   action_pb.mutable_env_data(), std::move(env_datas_[label][index]),
+                //   [&](rpcenv::NDArray* array, const torch::Tensor& tensor) {
+                //     return fill_ndarray_pb(array, tensor, /*start_dim=*/2);
+                //   });
+                fill_ndarray_pb(action_pb.mutable_env_data(), std::move(env_datas_[label][index]), 2);
+              }
+            }
+          }
 
           fill_nest_pb(
               action_pb.mutable_nest_action(), action,
@@ -434,8 +473,20 @@ class ActorPool {
           if (!stream->Read(&step_pb)) {
             throw py::connection_error("Read failed.");
           }
-          env_outputs = ActorPool::step_pb_to_nest(&step_pb);
+          TensorNest nest_action = nest_pb_to_nest(action_pb.mutable_nest_action(), array_pb_to_nest);
+          env_outputs = ActorPool::step_pb_to_nest(&step_pb, nest_action.front().item<int>());
           compute_inputs = TensorNest(std::vector({env_outputs, agent_state}));
+
+          if (step_pb.has_env_data()) {
+            int label = action_pb.save_env() / 16;
+            // int label = 0;
+            std::lock_guard<std::mutex> lock(mutexes_[label]);
+            env_datas_[label].push_back(array_pb_to_tensor(step_pb.mutable_env_data()));
+            while (env_datas_[label].size() > MAX_ENV_DATA_SIZE) {
+              env_datas_[label].pop_front();
+            }
+            // std::cout << "actorpool saving env!! label: " << label << std::endl; 
+          }
 
           last = TensorNest(std::vector({env_outputs, agent_outputs}));
           rollout.push_back(std::move(last));
@@ -477,12 +528,26 @@ class ActorPool {
 
   uint64_t count() const { return count_; }
 
+  std::vector<uint64_t> env_data_sizes() {
+    std::vector<uint64_t> sizes(num_labels_);
+    for (int i = 0; i < num_labels_; ++ i) {
+      std::lock_guard<std::mutex> lock(mutexes_[i]);
+      sizes[i] = env_datas_[i].size();
+    }
+    return sizes;
+  }
+
   static TensorNest array_pb_to_nest(rpcenv::NDArray* array_pb) {
     std::vector<int64_t> shape = {1, 1};  // [T=1, B=1].
     for (int i = 0, length = array_pb->shape_size(); i < length; ++i) {
       shape.push_back(array_pb->shape(i));
     }
     std::string* data = array_pb->release_data();
+
+    // if (array_pb->dtype() != 2) {
+    //   std::cout << "array_pb->dtype(): " << array_pb->dtype() << std::endl;
+    // }
+
     at::ScalarType dtype = torch::utils::numpy_dtype_to_aten(array_pb->dtype());
 
     return TensorNest(torch::from_blob(
@@ -490,19 +555,49 @@ class ActorPool {
         /*deleter=*/[data](void*) { delete data; }, dtype));
   }
 
-  static TensorNest step_pb_to_nest(rpcenv::Step* step_pb) {
+  static torch::Tensor array_pb_to_tensor(rpcenv::NDArray* array_pb) {
+    std::vector<int64_t> shape = {1, 1};  // [T=1, B=1].
+    for (int i = 0, length = array_pb->shape_size(); i < length; ++i) {
+      shape.push_back(array_pb->shape(i));
+    }
+    std::string* data = array_pb->release_data();
+
+    // if (array_pb->dtype() != 2) {
+    //   std::cout << "array_pb->dtype(): " << array_pb->dtype() << std::endl;
+    // }
+
+    at::ScalarType dtype = torch::utils::numpy_dtype_to_aten(array_pb->dtype());
+
+    return torch::from_blob(
+        data->data(), shape,
+        /*deleter=*/[data](void*) { delete data; }, dtype);
+  }
+
+  static TensorNest step_pb_to_nest(rpcenv::Step* step_pb, int action=0) {
+    TensorNest last_action = TensorNest(torch::full(
+        {1, 1}, action, torch::dtype(torch::kInt32)));
     TensorNest done = TensorNest(
         torch::full({1, 1}, step_pb->done(), torch::dtype(torch::kBool)));
+    TensorNest reset_done = TensorNest(
+        torch::full({1, 1}, step_pb->reset_done(), torch::dtype(torch::kBool)));
     TensorNest reward = TensorNest(torch::full({1, 1}, step_pb->reward()));
     TensorNest episode_step = TensorNest(torch::full(
         {1, 1}, step_pb->episode_step(), torch::dtype(torch::kInt32)));
     TensorNest episode_return =
         TensorNest(torch::full({1, 1}, step_pb->episode_return()));
+    // TensorNest episode_hash = TensorNest(torch::full(
+    //     {1, 1}, step_pb->episode_hash(), torch::dtype(torch::kInt32)));
+    TensorNest episode_server = TensorNest(torch::full(
+        {1, 1}, step_pb->episode_server(), torch::dtype(torch::kInt32)));
+    TensorNest episode_count = TensorNest(torch::full(
+        {1, 1}, step_pb->episode_count(), torch::dtype(torch::kInt32)));
 
     return TensorNest(std::vector(
         {nest_pb_to_nest(step_pb->mutable_observation(), array_pb_to_nest),
-         std::move(reward), std::move(done), std::move(episode_step),
-         std::move(episode_return)}));
+         nest_pb_to_nest(step_pb->mutable_last_observation(), array_pb_to_nest),
+         std::move(last_action),
+         std::move(reward), std::move(done), std::move(reset_done), std::move(episode_step),
+         std::move(episode_return), std::move(episode_server), std::move(episode_count)}));
   }
 
   static void fill_ndarray_pb(rpcenv::NDArray* array,
@@ -557,10 +652,15 @@ class ActorPool {
   std::atomic_uint64_t count_;
 
   const int unroll_length_;
+  const int num_labels_;
   std::shared_ptr<BatchingQueue<>> learner_queue_;
   std::shared_ptr<DynamicBatcher> inference_batcher_;
   const std::vector<std::string> env_server_addresses_;
   TensorNest initial_agent_state_;
+  std::vector<std::mutex> mutexes_;
+  std::vector<std::deque<torch::Tensor>> env_datas_;
+  std::mt19937 rng_;
+  mutable std::mutex rng_mutex_;
 };
 
 void init_actorpool(py::module& m) {
@@ -571,12 +671,13 @@ void init_actorpool(py::module& m) {
   py::class_<ActorPool>(m, "ActorPool")
       .def(py::init<int, std::shared_ptr<BatchingQueue<>>,
                     std::shared_ptr<DynamicBatcher>, std::vector<std::string>,
-                    TensorNest>(),
+                    TensorNest, int>(),
            py::arg("unroll_length"), py::arg("learner_queue").none(false),
            py::arg("inference_batcher").none(false),
-           py::arg("env_server_addresses"), py::arg("initial_agent_state"))
+           py::arg("env_server_addresses"), py::arg("initial_agent_state"), py::arg("num_labels") = 1)
       .def("run", &ActorPool::run, py::call_guard<py::gil_scoped_release>())
-      .def("count", &ActorPool::count);
+      .def("count", &ActorPool::count)
+      .def("env_data_sizes", &ActorPool::env_data_sizes);
 
   py::class_<DynamicBatcher::Batch, std::shared_ptr<DynamicBatcher::Batch>>(
       m, "Batch")

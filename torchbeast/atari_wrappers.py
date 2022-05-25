@@ -28,6 +28,7 @@ import numpy as np
 from collections import deque
 import gym
 from gym import spaces
+import crafter
 import cv2
 cv2.ocl.setUseOpenCL(False)
 
@@ -295,6 +296,12 @@ def make_atari(env_id, max_episode_steps=None):
     assert max_episode_steps is None
 
     return env
+
+
+def make_crafter():
+    env = gym.make('CrafterReward-v1', size=(84, 84), render_centering=False, health_reward_coef=0.0, immortal=True, idle_death=100)
+    return env
+
 
 def wrap_deepmind(env, episode_life=True, clip_rewards=True, frame_stack=False, scale=False):
     """Configure environment for DeepMind-style Atari.

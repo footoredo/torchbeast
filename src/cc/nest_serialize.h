@@ -21,37 +21,56 @@
 
 template <typename T, typename Function>
 void fill_nest_pb(rpcenv::ArrayNest* nest_pb, nest::Nest<T> nest,
-                  Function fill_ndarray_pb) {
+                  Function fill_ndarray_pb, int print=0) {
   using Nest = nest::Nest<T>;
   std::visit(
       nest::overloaded{
-          [nest_pb, &fill_ndarray_pb](const T t) {
+          [nest_pb, print, &fill_ndarray_pb](const T t) {
+            if (print) {
+              std::cout << print << " const T t" << std::endl;
+            }
             fill_ndarray_pb(nest_pb->mutable_array(), t);
           },
-          [nest_pb, &fill_ndarray_pb](const std::vector<Nest>& v) {
+          [nest_pb, print, &fill_ndarray_pb](const std::vector<Nest>& v) {
+            if (print) {
+              std::cout << print << " const std::vector<Nest>& v" << std::endl;
+            }
             for (const Nest& n : v) {
               rpcenv::ArrayNest* subnest = nest_pb->add_vector();
-              fill_nest_pb(subnest, n, fill_ndarray_pb);
+              fill_nest_pb(subnest, n, fill_ndarray_pb, print);
             }
           },
-          [nest_pb, &fill_ndarray_pb](const std::map<std::string, Nest>& m) {
+          [nest_pb, print, &fill_ndarray_pb](const std::map<std::string, Nest>& m) {
+            if (print) {
+              std::cout << print << " const std::map<std::string, Nest>& m" << std::endl;
+            }
             auto* map_pb = nest_pb->mutable_map();
             for (const auto& p : m) {
+              // std::cout << p.first << std::endl;
               rpcenv::ArrayNest& subnest_pb = (*map_pb)[p.first];
-              fill_nest_pb(&subnest_pb, p.second, fill_ndarray_pb);
+              fill_nest_pb(&subnest_pb, p.second, fill_ndarray_pb, print);
             }
           }},
       nest.value);
+  if (print) {
+    std::cout << print << " finished" << std::endl;
+  }
 }
 
 template <typename Function>
 std::invoke_result_t<Function, rpcenv::NDArray*> nest_pb_to_nest(
-    rpcenv::ArrayNest* nest_pb, Function array_to_nest) {
+    rpcenv::ArrayNest* nest_pb, Function array_to_nest, int print=0) {
   using Nest = std::invoke_result_t<Function, rpcenv::NDArray*>;
   if (nest_pb->has_array()) {
+    if (print) {
+      std::cout << print << " has_array" << std::endl;
+    }
     return array_to_nest(nest_pb->mutable_array());
   }
   if (nest_pb->vector_size() > 0) {
+    if (print) {
+      std::cout << print << " vector_size" << std::endl;
+    }
     std::vector<Nest> v;
     for (int i = 0, length = nest_pb->vector_size(); i < length; ++i) {
       v.push_back(nest_pb_to_nest(nest_pb->mutable_vector(i), array_to_nest));
@@ -59,11 +78,16 @@ std::invoke_result_t<Function, rpcenv::NDArray*> nest_pb_to_nest(
     return Nest(std::move(v));
   }
   if (nest_pb->map_size() > 0) {
+    if (print) {
+      std::cout << print << " map_size" << std::endl;
+    }
     std::map<std::string, Nest> m;
     for (auto& p : *nest_pb->mutable_map()) {
       m[p.first] = nest_pb_to_nest(&p.second, array_to_nest);
     }
     return Nest(std::move(m));
   }
-  throw std::invalid_argument("ArrayNest proto contained no data.");
+  std::string message = "ArrayNest proto contained no data. ";
+  message.append(std::to_string(print));
+  throw std::invalid_argument(message);
 }

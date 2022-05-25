@@ -139,3 +139,11 @@ dmypy.json
 
 # VSCode
 .vscode
+
+nle_data
+
+images/
+
+see.ipynb
+*.sh
+*.bak

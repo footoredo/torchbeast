@@ -21,6 +21,9 @@ package rpcenv;
 message Action {
   optional int32 action = 1;
   optional ArrayNest nest_action = 2;
+  optional int32 save_env = 3;
+  optional int32 env_data_label = 4;
+  optional NDArray env_data = 5;
 }
 
 message NDArray {
@@ -39,8 +42,13 @@ message Step {
   optional ArrayNest observation = 1;
   optional float reward = 2;
   optional bool done = 3;
-  optional int32 episode_step = 4;
-  optional float episode_return = 5;
+  optional bool reset_done = 4;
+  optional int32 episode_step = 5;
+  optional float episode_return = 6;
+  optional int32 episode_server = 7;
+  optional int32 episode_count = 8;
+  optional NDArray env_data = 9;
+  optional ArrayNest last_observation = 10;
 }
 
 service RPCEnvServer {

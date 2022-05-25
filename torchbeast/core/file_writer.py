@@ -186,6 +186,7 @@ class FileWriter:
                 self.fieldnames.append(k)
         if old_len != len(self.fieldnames):
             self._fieldwriter.writerow(self.fieldnames)
+            self._fieldfile.flush()
             self._logger.info("Updated log fields: %s", self.fieldnames)
 
         if to_log["_tick"] == 0:
